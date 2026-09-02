@@ -23,6 +23,9 @@ Changelog rispetto alla Rev. Alpha:
   lettura
 - "IDLE" ora viene pubblicato una sola volta al rilascio del pulsante invece che ad ogni
   ciclo (~20ms) mentre il pulsante non e' premuto: riduce di molto il traffico MQTT
+- Aggiunto il comando MQTT delle 8 uscite relè del modulo di espansione (Opta1/relayOutExp/set/1-8):
+  prima esisteva solo la lettura degli ingressi del modulo, le sue uscite non erano mai state
+  cablate al comando MQTT nonostante la struttura dati fosse gia' predisposta
 */
 
 #include <SPI.h>
@@ -91,6 +94,21 @@ void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
       }
     }
   }
+
+  // Uscite del modulo di espansione (rele' 1-8, es. Opta Ext D1608E). Prima non esisteva
+  // nessun comando MQTT per queste uscite: la struttura dati optaExp.output[8] era gia'
+  // predisposta ma non veniva mai scritta ne' collegata all'hardware.
+  DigitalMechExpansion mechExpOut = OptaController.getExpansion(0);
+  for (uint8_t u = 1; u <= EXP_OUT_CHANNELS; u++) {
+    String topicExp = String(MQTT_COMMAND_EXP_TOPIC) + String(u);
+
+    if (topicExp.equals(p_topic)) {
+      optaExp.output[u - 1] = state;
+      mechExpOut.digitalWrite(u - 1, state ? HIGH : LOW);
+      publishState(u, payload.c_str(), 4);
+      break;
+    }
+  }
 }
 
 boolean reconnect() {
@@ -106,13 +124,27 @@ boolean reconnect() {
     client.subscribe("Opta1/relayOut/set/3");
     client.subscribe("Opta1/relayOut/set/4");
 
-    // Risincronizzazione: ripubblica lo stato attuale dei 4 rele' (retained) cosi che
+    // Uscite del modulo di espansione
+    client.subscribe("Opta1/relayOutExp/set/1");
+    client.subscribe("Opta1/relayOutExp/set/2");
+    client.subscribe("Opta1/relayOutExp/set/3");
+    client.subscribe("Opta1/relayOutExp/set/4");
+    client.subscribe("Opta1/relayOutExp/set/5");
+    client.subscribe("Opta1/relayOutExp/set/6");
+    client.subscribe("Opta1/relayOutExp/set/7");
+    client.subscribe("Opta1/relayOutExp/set/8");
+
+    // Risincronizzazione: ripubblica lo stato attuale dei rele' (retained) cosi che
     // Home Assistant si aggiorni subito dopo un proprio riavvio, senza dover aspettare
     // il prossimo cambio di stato reale.
     publishState(1, opta.out_1 ? "ON" : "OFF", 2);
     publishState(2, opta.out_2 ? "ON" : "OFF", 2);
     publishState(3, opta.out_3 ? "ON" : "OFF", 2);
     publishState(4, opta.out_4 ? "ON" : "OFF", 2);
+
+    for (uint8_t u = 1; u <= EXP_OUT_CHANNELS; u++) {
+      publishState(u, optaExp.output[u - 1] ? "ON" : "OFF", 4);
+    }
 
     digitalWrite(LEDR, LOW);
     digitalWrite(LED_BUILTIN, HIGH);
@@ -135,8 +167,8 @@ bool publishState(int n, const char* payload, int type) {
       client.publish(topic, payload);
       break;
     case 2:
-      // Stato dei rele': retained, cosi chi si connette dopo (es. HA dopo un riavvio)
-      // vede subito l'ultimo stato noto senza dover aspettare un cambiamento.
+      // Stato dei rele' locali: retained, cosi chi si connette dopo (es. HA dopo un
+      // riavvio) vede subito l'ultimo stato noto senza dover aspettare un cambiamento.
       strcpy(topic, MQTT_STATE_TOPIC);
       strcat(topic, channel);
       client.publish(topic, payload, true);
@@ -145,6 +177,13 @@ bool publishState(int n, const char* payload, int type) {
       strcpy(topic, MQTT_INPUT_ACTION_TOPIC);
       strcat(topic, channel);
       client.publish(topic, payload);
+      break;
+    case 4:
+      // Stato dei rele' del modulo di espansione: stesso trattamento (retained) dei
+      // rele' locali.
+      strcpy(topic, MQTT_STATE_EXP_TOPIC);
+      strcat(topic, channel);
+      client.publish(topic, payload, true);
       break;
     default:
       return false;
