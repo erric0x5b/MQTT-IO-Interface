@@ -7,10 +7,13 @@
 #define OUT_CHANNELS 4
 #define IN_CHANNELS 8       // pulsanti fisici locali (A0-A7), BTN_USER e i canali di espansione sono gestiti a parte
 #define EXP_INPUT_CHANNELS 16
+#define EXP_OUT_CHANNELS 8  // relè di uscita sul modulo di espansione (Opta Ext D1608E)
 #define RECONNECT_INTERVAL 5000  // ms tra un tentativo di riconnessione MQTT e il successivo (nessun limite al numero di tentativi)
 
 #define MQTT_COMMAND_TOPIC "Opta1/relayOut/set/"
 #define MQTT_STATE_TOPIC "Opta1/relayOut/state/"
+#define MQTT_COMMAND_EXP_TOPIC "Opta1/relayOutExp/set/"
+#define MQTT_STATE_EXP_TOPIC "Opta1/relayOutExp/state/"
 #define MQTT_INPUT_STATE_TOPIC "Opta1/input/state/"
 #define MQTT_INPUT_ACTION_TOPIC "Opta1/input/action/"
 #define MQTT_AVAILABLE_TOPIC "Opta1/available"
