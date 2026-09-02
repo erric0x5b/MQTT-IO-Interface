@@ -5,9 +5,9 @@
 #define LONG_PRESS 3000
 
 #define OUT_CHANNELS 4
-#define IN_CHANNELS 9
+#define IN_CHANNELS 8       // pulsanti fisici locali (A0-A7), BTN_USER e i canali di espansione sono gestiti a parte
 #define EXP_INPUT_CHANNELS 16
-#define MAX_RECONNECTIONS 50
+#define RECONNECT_INTERVAL 5000  // ms tra un tentativo di riconnessione MQTT e il successivo (nessun limite al numero di tentativi)
 
 #define MQTT_COMMAND_TOPIC "Opta1/relayOut/set/"
 #define MQTT_STATE_TOPIC "Opta1/relayOut/state/"
@@ -45,12 +45,6 @@ typedef struct t_optaExp {
   int input[16];
 } t_optaExp;
 
-typedef struct t_inputStatus {
-  unsigned int channelState[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-  unsigned int channelLast[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-  unsigned long channelStart[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-} t_inputStatus;
-
 typedef struct t_instatus {
   bool lastState;
   unsigned long startTime;
@@ -61,9 +55,18 @@ long lastStart = 0;
 bool cycleState = false;
 bool serverConnected = false;
 
-const int channelMatrix[8] = { 0, 1, 2, 3 };  //assegnazione output a ogni ingresso. ES: IN_1 -> channelMatrix[0]
-const int channelLEDMatrix[8] = { LED_D0, LED_D1, LED_D2, LED_D3 };
-unsigned int channelState[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };  //variabile per memorizzare gli stati degli ingressi
+// Mappa ogni ingresso locale (1-4) al relativo output fisico per il comando offline (MQTT non disponibile).
+// Solo i primi 4 ingressi hanno un relè locale corrispondente: gli ingressi 5-8, il pulsante utente e i canali
+// di espansione vengono comunque riportati via MQTT (quando disponibile) ma non hanno un'azione locale diretta.
+const int channelMatrix[OUT_CHANNELS] = { 0, 1, 2, 3 };
+const int channelLEDMatrix[OUT_CHANNELS] = { LED_D0, LED_D1, LED_D2, LED_D3 };
+unsigned int channelState[OUT_CHANNELS] = { 0, 0, 0, 0 };  // stato locale (fallback) dei soli 4 relè fisici
+
+// Stato di debounce/pressione per ogni ingresso locale (1-8), il pulsante utente (indice 8) e
+// i canali del modulo di espansione (16 canali).
+t_instatus inState[IN_CHANNELS];
+t_instatus btnUserState;
+t_instatus expState[EXP_INPUT_CHANNELS];
 
 // Update these with values suitable for your hardware/network.
 byte mac[] = { 0xDE, 0xED, 0xBA, 0xFE, 0xFE, 0xED };

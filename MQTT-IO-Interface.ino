@@ -1,7 +1,28 @@
 /*
 MQTT I/O interface, STM32 and ethernet based.
-Rev. Alpha - 10/2024
+Rev. Beta - 09/2026
 E.T. Design
+
+Changelog rispetto alla Rev. Alpha:
+- Riconnessione MQTT senza limite di tentativi (prima si fermava dopo 50 tentativi/~4 minuti
+  e richiedeva un riavvio manuale del dispositivo)
+- Stato dei relè pubblicato come "retained" e ripubblicato ad ogni riconnessione, cosi Home
+  Assistant si risincronizza subito dopo un proprio riavvio o un'interruzione di rete
+- Tutti gli ingressi locali (A0-A7, pulsante utente, modulo di espansione) vengono ora letti
+  ad OGNI ciclo da 20ms invece che uno alla volta a rotazione: prima ogni pulsante veniva
+  controllato solo una volta ogni ~200ms, e una pressione rapida poteva cadere tra due
+  controlli e non venire mai rilevata
+- Corretta la segnalazione SHORT/LONG press degli ingressi 1 e 2, che finiva sul topic
+  sbagliato (input/state invece di input/action) rispetto agli altri ingressi
+- Corretto un accesso fuori dai limiti degli array channelMatrix/channelLEDMatrix quando il
+  comando offline veniva invocato per canali del modulo di espansione (indici fino a 24 su
+  array di 4 elementi): ora il comando locale si applica solo ai 4 ingressi con un relè
+  fisico corrispondente, gli altri canali vengono comunque riportati via MQTT ma senza
+  azione locale
+- Corretto un errore che escludeva il primo canale (indice 0) del modulo di espansione dalla
+  lettura
+- "IDLE" ora viene pubblicato una sola volta al rilascio del pulsante invece che ad ogni
+  ciclo (~20ms) mentre il pulsante non e' premuto: riduce di molto il traffico MQTT
 */
 
 #include <SPI.h>
@@ -17,8 +38,9 @@ PubSubClient client(ethClient);
 
 t_opta opta;
 t_optaExp optaExp;
-t_instatus in1, in2, in3, in4, in5, in6, in7, in8;
-t_inputStatus plc, exp1;
+
+bool publishState(int n, const char* payload, int type);
+void offlineCommand(int channel, const char* action);
 
 void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
   // Concat the payload into a string
@@ -35,32 +57,32 @@ void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
     state = false;
   }
 
-  for (uint8_t u = 1; u <= OUT_CHANNELS; u++) {  // Correzione: partire da 1
+  for (uint8_t u = 1; u <= OUT_CHANNELS; u++) {
     String topic = String(MQTT_COMMAND_TOPIC) + String(u);
 
     if (topic.equals(p_topic)) {
       switch (u) {
         case 1:
           opta.out_1 = state;
-          publishState(1, payload, 2);
+          publishState(1, payload.c_str(), 2);
           digitalWrite(D0, opta.out_1);
           digitalWrite(LED_D0, opta.out_1);
           break;
         case 2:
           opta.out_2 = state;
-          publishState(2, payload, 2);
+          publishState(2, payload.c_str(), 2);
           digitalWrite(D1, opta.out_2);
           digitalWrite(LED_D1, opta.out_2);
           break;
         case 3:
           opta.out_3 = state;
-          publishState(3, payload, 2);
+          publishState(3, payload.c_str(), 2);
           digitalWrite(D2, opta.out_3);
           digitalWrite(LED_D2, opta.out_3);
           break;
         case 4:
           opta.out_4 = state;
-          publishState(4, payload, 2);
+          publishState(4, payload.c_str(), 2);
           digitalWrite(D3, opta.out_4);
           digitalWrite(LED_D3, opta.out_4);
           break;
@@ -84,6 +106,14 @@ boolean reconnect() {
     client.subscribe("Opta1/relayOut/set/3");
     client.subscribe("Opta1/relayOut/set/4");
 
+    // Risincronizzazione: ripubblica lo stato attuale dei 4 rele' (retained) cosi che
+    // Home Assistant si aggiorni subito dopo un proprio riavvio, senza dover aspettare
+    // il prossimo cambio di stato reale.
+    publishState(1, opta.out_1 ? "ON" : "OFF", 2);
+    publishState(2, opta.out_2 ? "ON" : "OFF", 2);
+    publishState(3, opta.out_3 ? "ON" : "OFF", 2);
+    publishState(4, opta.out_4 ? "ON" : "OFF", 2);
+
     digitalWrite(LEDR, LOW);
     digitalWrite(LED_BUILTIN, HIGH);
 
@@ -92,28 +122,29 @@ boolean reconnect() {
   return client.connected();
 }
 
-bool publishState(int n, String payload, int type) {
-  char channel[2];  // Buffer per il numero come stringa
-  char topic[50];   // Buffer per il topic finale
+bool publishState(int n, const char* payload, int type) {
+  char channel[3];
+  char topic[50];
 
   itoa(n, channel, 10);
 
-  // Costruisci il topic
   switch (type) {
     case 1:
       strcpy(topic, MQTT_INPUT_STATE_TOPIC);
       strcat(topic, channel);
-      client.publish(topic, payload.c_str());
+      client.publish(topic, payload);
       break;
     case 2:
+      // Stato dei rele': retained, cosi chi si connette dopo (es. HA dopo un riavvio)
+      // vede subito l'ultimo stato noto senza dover aspettare un cambiamento.
       strcpy(topic, MQTT_STATE_TOPIC);
       strcat(topic, channel);
-      client.publish(topic, payload.c_str());
+      client.publish(topic, payload, true);
       break;
     case 3:
       strcpy(topic, MQTT_INPUT_ACTION_TOPIC);
       strcat(topic, channel);
-      client.publish(topic, payload.c_str());
+      client.publish(topic, payload);
       break;
     default:
       return false;
@@ -121,32 +152,60 @@ bool publishState(int n, String payload, int type) {
   return true;
 }
 
-void offlineCommand(int channel, char* payload) {
-  bool state = false;
-  channel--;
+// Comando locale di fallback quando MQTT non e' disponibile. Si applica solo ai canali
+// 1-4, gli unici con un rele' fisico corrispondente (vedi channelMatrix in globals.h).
+// Per tutti gli altri ingressi la funzione non ha nulla da commutare localmente e ritorna
+// subito: prima, invece, veniva chiamata anche per i 16 canali del modulo di espansione
+// (indici fino a 24) e accedeva fuori dai limiti di array dimensionati per 4 elementi.
+void offlineCommand(int channel, const char* action) {
+  channel--;  // da numero canale (1-based) a indice array (0-based)
 
-  if (strcmp(payload, "PRESS") == 0 && !serverConnected) {
-    state = true;
-    if (channelState[channel] == 1) {
-      channelState[channel] = 0;
-    } else {
-      channelState[channel] = 1;
-    }
-  } else {
-    state = false;
+  if (channel < 0 || channel >= OUT_CHANNELS) {
+    return;
   }
 
-  if (channelState[channel] == 1) {
-    strcpy(payload, "ON");
-    publishState(channel + 1, "ON", 2);
-  } else {
-    strcpy(payload, "OFF");
-    publishState(channel + 1, "OFF", 2);
+  if (strcmp(action, "PRESS") == 0 && !serverConnected) {
+    channelState[channel] = channelState[channel] ? 0 : 1;
   }
 
-  if (serverConnected == false) {
+  publishState(channel + 1, channelState[channel] ? "ON" : "OFF", 2);
+
+  if (!serverConnected) {
     digitalWrite(channelMatrix[channel], channelState[channel]);
     digitalWrite(channelLEDMatrix[channel], channelState[channel]);
+  }
+}
+
+// Gestisce debounce, rilevamento pressione e classificazione SHORT/LONG per un singolo
+// ingresso. Chiamata per tutti gli ingressi locali, il pulsante utente e i canali di
+// espansione: prima questa logica era duplicata (e leggermente incoerente tra un canale
+// e l'altro, vedi changelog) in un grande switch/case, ora e' un'unica funzione condivisa
+// usata per tutti.
+void processInput(int channel, bool pressed, t_instatus &st) {
+  if (pressed) {
+    if (st.lastState) {
+      unsigned long held = millis() - st.startTime;
+      if (held > SHORT_PRESS && held < LONG_PRESS) {
+        publishState(channel, "SHORT", 3);
+      } else if (held > LONG_PRESS) {
+        publishState(channel, "LONG", 3);
+      }
+    } else {
+      publishState(channel, "PRESS", 1);
+      st.lastState = true;
+      st.startTime = millis();
+      offlineCommand(channel, "PRESS");
+    }
+  } else {
+    // Pubblica "IDLE" una sola volta al rilascio, non ad ogni ciclo: prima veniva
+    // pubblicato incondizionatamente ogni 20ms per ogni ingresso non premuto, il che
+    // significava un flusso costante di messaggi MQTT ridondanti (e probabilmente
+    // contribuiva a rendere meno affidabile la consegna dei messaggi "PRESS" veri).
+    if (st.lastState) {
+      publishState(channel, "IDLE", 1);
+    }
+    st.lastState = false;
+    st.startTime = 0;
   }
 }
 
@@ -206,16 +265,15 @@ void setup() {
 
 void loop() {
   unsigned long taskStart = millis();
-  static int counter = 1;
-  static int reconnectionCounter = 0;
 
   OptaController.update();
 
-  // MQTT connection
-  if (!client.connected() && reconnectionCounter < MAX_RECONNECTIONS) {
+  // Connessione MQTT: riprova ogni RECONNECT_INTERVAL ms, SENZA limite al numero di
+  // tentativi. In precedenza il firmware si arrendeva dopo 50 tentativi (~4 minuti) e
+  // restava scollegato finche' non veniva riavviato manualmente.
+  if (!client.connected()) {
     unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
-      reconnectionCounter++;
+    if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
       lastReconnectAttempt = now;
       serverConnected = false;
 
@@ -223,217 +281,37 @@ void loop() {
       if (reconnect()) {
         lastReconnectAttempt = 0;
       } else {
-        Serial.println("Connection failed. Attempting reconnection in 5 sec");
+        Serial.println("Connection failed. Retrying in 5 sec");
         digitalWrite(LEDR, HIGH);
         digitalWrite(LED_BUILTIN, LOW);
       }
     }
   } else {
-    reconnectionCounter = 0;
     // Client connected
     client.loop();
   }
 
-  // 50Hz task
+  // Task da 50Hz: legge TUTTI gli ingressi ad ogni ciclo. Prima venivano letti uno alla
+  // volta a rotazione (un canale diverso per ciclo, tramite un contatore), quindi ogni
+  // singolo pulsante veniva effettivamente controllato solo una volta ogni ~200ms e una
+  // pressione rapida poteva cadere tra due controlli e non venire mai rilevata.
   if (taskStart - lastStart > CYCLE_TIME) {
     lastStart = taskStart;
     getDigitalExpansion();
 
-    switch (counter) {
-      case 1:
-
-        if (digitalRead(A0)) {
-          if (in1.lastState) {
-
-            if (millis() - in1.startTime > SHORT_PRESS && millis() - in1.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 1);
-            } else if (millis() - in1.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 1);
-            }
-          } else if (millis() - in1.startTime > SHORT_PRESS) {
-            publishState(counter, "PRESS", 1);
-            in1.lastState = true;
-            in1.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in1.lastState = false;
-          in1.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 2:
-        if (digitalRead(A1)) {
-          if (in2.lastState) {
-            if (millis() - in2.startTime > SHORT_PRESS && millis() - in2.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 1);
-            } else if (millis() - in2.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 1);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in2.lastState = true;
-            in2.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in2.lastState = false;
-          in2.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 3:
-        if (digitalRead(A2)) {
-          if (in3.lastState) {
-            if (millis() - in3.startTime > SHORT_PRESS && millis() - in3.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in3.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in3.lastState = true;
-            in3.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in3.lastState = false;
-          in3.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 4:
-        if (digitalRead(A3)) {
-          if (in4.lastState) {
-            if (millis() - in4.startTime > SHORT_PRESS && millis() - in4.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in4.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in4.lastState = true;
-            in4.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in4.lastState = false;
-          in4.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 5:
-        if (digitalRead(A4)) {
-          if (in5.lastState) {
-            if (millis() - in5.startTime > SHORT_PRESS && millis() - in5.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in5.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in5.lastState = true;
-            in5.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in5.lastState = false;
-          in5.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 6:
-        if (digitalRead(A5)) {
-          if (in6.lastState) {
-            if (millis() - in6.startTime > SHORT_PRESS && millis() - in6.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in6.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in6.lastState = true;
-            in6.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in6.lastState = false;
-          in6.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 7:
-        if (digitalRead(A6)) {
-          if (in7.lastState) {
-            if (millis() - in7.startTime > SHORT_PRESS && millis() - in7.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in7.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in7.lastState = true;
-            in7.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in7.lastState = false;
-          in7.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 8:
-        if (digitalRead(A7)) {
-          if (in8.lastState) {
-            if (millis() - in8.startTime > SHORT_PRESS && millis() - in8.startTime < LONG_PRESS) {
-              publishState(counter, "SHORT", 3);
-            } else if (millis() - in8.startTime > LONG_PRESS) {
-              publishState(counter, "LONG", 3);
-            }
-          } else {
-            publishState(counter, "PRESS", 1);
-            in8.lastState = true;
-            in8.startTime = millis();
-            offlineCommand(counter, "PRESS");
-          }
-        } else {
-          in8.lastState = false;
-          in8.startTime = 0;
-          publishState(counter, "IDLE", 1);
-        }
-        break;
-      case 9:
-        if (digitalRead(BTN_USER)) {
-          publishState(counter, "PRESS", 1);
-        }
-        break;
-      case 10:
-        for (int x = 1; x < EXP_INPUT_CHANNELS; x++) {
-          unsigned int expChannel = counter + x;
-          if (optaExp.input[x]) {
-            if (exp1.channelLast[x]) {
-              if (millis() - exp1.channelStart[x] > SHORT_PRESS && millis() - exp1.channelStart[x] < LONG_PRESS) {
-                publishState(expChannel, "SHORT", 3);
-              } else if (millis() - exp1.channelStart[x] > LONG_PRESS) {
-                publishState(expChannel, "LONG", 3);
-              }
-            } else {
-              publishState(expChannel, "PRESS", 1);
-              exp1.channelLast[x] = true;
-              exp1.channelStart[x] = millis();
-              offlineCommand(expChannel, "PRESS");
-            }
-          } else {
-            exp1.channelLast[x] = false;
-            exp1.channelStart[x] = 0;
-            publishState(expChannel, "IDLE", 1);
-          }
-        }
-        break;
+    static const int localPins[IN_CHANNELS] = { A0, A1, A2, A3, A4, A5, A6, A7 };
+    for (int i = 0; i < IN_CHANNELS; i++) {
+      processInput(i + 1, digitalRead(localPins[i]), inState[i]);
     }
 
-    if (counter++ > IN_CHANNELS) {
-      counter = 1;
+    // Pulsante utente a bordo Opta: canale IN_CHANNELS+1 (=9), stessa numerazione di prima.
+    processInput(IN_CHANNELS + 1, digitalRead(BTN_USER), btnUserState);
+
+    // Canali del modulo di espansione: numerati a partire da IN_CHANNELS+2 (=10), quindi
+    // 10-25, esattamente come nella numerazione originale. Prima il ciclo partiva da
+    // x=1 invece di x=0, escludendo sempre il primo canale di espansione dalla lettura.
+    for (int x = 0; x < EXP_INPUT_CHANNELS; x++) {
+      processInput(IN_CHANNELS + 2 + x, optaExp.input[x], expState[x]);
     }
   }
 }
